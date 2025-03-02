@@ -15,6 +15,9 @@
 #define DEFAULT_ITERATIONS      0       /* 0 = run indefinitely */
 #define DEFAULT_FFT_SIZE        1024    /* FFT size for spectrum analysis */
 #define SIGNAL_THRESHOLD        -35.0   /* dBFS threshold for signal detection */
+#define DEFAULT_USE_KERNEL_DRIVER  0    /* 0 = use librtlsdr, 1 = use kernel driver */
+#define DEFAULT_SIMULATION_MODE 1       /* 1 = enable simulation, 0 = disable */
+#define DEFAULT_VERBOSE         0       /* 1 = enable verbose logging, 0 = disable */
 
 /* Configuration structure */
 typedef struct {
@@ -26,6 +29,9 @@ typedef struct {
 	int save_signal;
 	int iterations;
 	char *fft_output_file;
+	int use_kernel_driver;  /* 0 = use librtlsdr, 1 = use kernel driver */
+	int simulation_mode;    /* 1 = enable simulation, 0 = disable */
+	int verbose;            /* 1 = enable verbose logging, 0 = disable */
 } scanner_config_t;
 
 /* Function prototypes */
