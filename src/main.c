@@ -13,6 +13,20 @@
 #include <errno.h>              /* For errno */
 #include "rf_scanner.h"
 
+/* LIBUSB error codes for use in try_detach_kernel_driver */
+#ifndef LIBUSB_ERROR_NOT_FOUND
+#define LIBUSB_ERROR_NOT_FOUND    -5
+#endif
+#ifndef LIBUSB_ERROR_NO_DEVICE
+#define LIBUSB_ERROR_NO_DEVICE    -4
+#endif
+#ifndef LIBUSB_ERROR_INVALID_PARAM
+#define LIBUSB_ERROR_INVALID_PARAM -2
+#endif
+#ifndef LIBUSB_ERROR_OTHER
+#define LIBUSB_ERROR_OTHER        -99
+#endif
+
 /* Global variables for signal handling */
 static rtlsdr_dev_t *device = NULL;
 static int do_exit = 0;
@@ -167,6 +181,10 @@ double random_frequency(double start, double stop, uint32_t sample_rate) {
 int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, double gain) {
 	int device_count, device_index = 0, r;
 	
+	/* Get verbose mode from global config */
+	extern scanner_config_t global_config;
+	int verbose = global_config.verbose;
+	
 	/* Get number of devices */
 	device_count = rtlsdr_get_device_count();
 	if (!device_count) {
@@ -177,6 +195,16 @@ int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, d
 	fprintf(stderr, "Found %d device(s)\n", device_count);
 	fprintf(stderr, "Using device #%d: %s\n", device_index, 
 		rtlsdr_get_device_name(device_index));
+
+	/* Display more device info if verbose */
+	if (verbose) {
+		char manufacturer[256] = {0};
+		char product[256] = {0};
+		char serial[256] = {0};
+		rtlsdr_get_device_usb_strings(0, manufacturer, product, serial);
+		fprintf(stderr, "Device info: Manufacturer='%s', Product='%s', Serial='%s'\n",
+			manufacturer, product, serial);
+	}
 	
 	/* Try to close the device first if it was already open */
 	if (*dev) {
@@ -186,14 +214,26 @@ int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, d
 		usleep(100000); /* Wait 100ms */
 	}
 	
+	/* Attempt to unload kernel modules that might interfere */
+	if (verbose) {
+		fprintf(stderr, "Checking for active kernel modules...\n");
+		system("lsmod | grep -E 'rtl|dvb' | sort");
+	}
+	
 	/* Open device with retry attempt */
 	for (int attempt = 0; attempt < 3; attempt++) {
 		r = rtlsdr_open(dev, (uint32_t)device_index);
 		if (r >= 0) {
 			fprintf(stderr, "Successfully opened device\n");
 			
-			/* Attempt to detach kernel driver if needed */
-			try_detach_kernel_driver(*dev);
+			/* Attempt to detach kernel driver if needed - CRITICAL STEP */
+			/* Must be done immediately after opening and before any other operations */
+			r = try_detach_kernel_driver(*dev);
+			if (r < 0) {
+				fprintf(stderr, "Warning: Could not detach kernel driver, but will continue anyway\n");
+				/* Continue anyway - the device might still work */
+			}
+			
 			break; /* Success */
 		}
 		
@@ -202,7 +242,10 @@ int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, d
 			
 		if (r == -6) {
 			fprintf(stderr, "Error -6 indicates the device is already claimed by another process or driver\n");
-			fprintf(stderr, "Try using 'sudo rmmod dvb_usb_rtl28xxu rtl2832' to unload kernel drivers\n");
+			fprintf(stderr, "Trying to identify the process using the device...\n");
+			system("lsof | grep -i rtlsdr");
+			system("lsof /dev/bus/usb"); /* More generic check */
+			fprintf(stderr, "Try using 'sudo rmmod dvb_usb_rtl28xxu rtl2832_sdr rtl2832' to unload kernel drivers\n");
 		}
 		
 		if (attempt < 2) {
@@ -293,7 +336,13 @@ int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, d
 	}
 	
 	/* Reset endpoint before streaming */
-	rtlsdr_reset_buffer(*dev);
+	r = rtlsdr_reset_buffer(*dev);
+	if (r < 0) {
+		fprintf(stderr, "Warning: Failed to reset buffer: %d\n", r);
+		/* Continue anyway - this might not be fatal */
+	} else {
+		fprintf(stderr, "Successfully reset buffer\n");
+	}
 	
 	return 0;
 }
@@ -588,12 +637,60 @@ void save_fft_to_file(const char *filename, fftw_complex *fft_result, int fft_si
 int try_detach_kernel_driver(rtlsdr_dev_t *dev) {
 	if (!dev) return -1;
 	
-	/* Access the internal libusb device handle from the rtlsdr device */
-	/* Note: This relies on knowledge of the rtlsdr library internals */
 	fprintf(stderr, "Attempting to detach kernel driver...\n");
 	
-	/* Check if USB device exists */
-	fprintf(stderr, "Checking USB devices by librtlsdr functions...\n");
+	/* Access the internal libusb device handle from the rtlsdr device */
+	/* This requires knowledge of rtlsdr library internals */
+	/* Based on examining librtlsdr source code */
+	
+	/* Cast dev to access internal structure */
+	struct rtlsdr_dev {
+		libusb_context *ctx;
+		libusb_device_handle *devh;
+		/* ... other fields we don't need to access ... */
+	} *rtl_dev = (struct rtlsdr_dev *)dev;
+	
+	/* Skip if we can't access the device handle */
+	if (!rtl_dev || !rtl_dev->devh) {
+		fprintf(stderr, "Cannot access device handle (library internals may have changed)\n");
+		return -1;
+	}
+	
+	/* Check if kernel driver is active */
+	if (libusb_kernel_driver_active(rtl_dev->devh, 0) == 1) {
+		fprintf(stderr, "Kernel driver is active, attempting to detach...\n");
+		
+		/* Try to detach the kernel driver */
+		int r = libusb_detach_kernel_driver(rtl_dev->devh, 0);
+		if (r == 0) {
+			fprintf(stderr, "Successfully detached kernel driver\n");
+			return 0;
+		} else {
+			fprintf(stderr, "Failed to detach kernel driver: %d\n", r);
+			switch (r) {
+				case LIBUSB_ERROR_NOT_FOUND:
+					fprintf(stderr, "No kernel driver was attached\n");
+					return 0; /* Not an error */
+				case LIBUSB_ERROR_INVALID_PARAM:
+					fprintf(stderr, "Invalid parameter\n");
+					break;
+				case LIBUSB_ERROR_NO_DEVICE:
+					fprintf(stderr, "Device has been disconnected\n");
+					break;
+				case LIBUSB_ERROR_OTHER:
+					fprintf(stderr, "Other error\n");
+					break;
+				default:
+					fprintf(stderr, "Unknown error\n");
+			}
+			return -1;
+		}
+	} else {
+		fprintf(stderr, "Kernel driver is not active, no need to detach\n");
+	}
+	
+	/* Additional diagnostics for troubleshooting */
+	fprintf(stderr, "Checking USB devices...\n");
 	int device_count = rtlsdr_get_device_count();
 	fprintf(stderr, "Number of RTL-SDR devices found by librtlsdr: %d\n", device_count);
 	
@@ -608,72 +705,10 @@ int try_detach_kernel_driver(rtlsdr_dev_t *dev) {
 			manufacturer, product, serial);
 	}
 	
-	/* Try the rtlsdr library function first */
-	int r = rtlsdr_set_bias_tee(dev, 0);
+	/* Try resetting the buffer as a test of device access */
+	int r = rtlsdr_reset_buffer(dev);
 	if (r < 0) {
-		fprintf(stderr, "Failed to toggle bias tee (this is just to test device access): %d\n", r);
-		
-		switch(r) {
-			case -1:
-				fprintf(stderr, "Error -1: Unsupported device/function\n");
-				break;
-			case -2:
-				fprintf(stderr, "Error -2: Not enough memory\n");
-				break;
-			case -3:
-				fprintf(stderr, "Error -3: Device not found\n");
-				break;
-			case -4:
-				fprintf(stderr, "Error -4: Device busy\n");
-				break;
-			case -5:
-				fprintf(stderr, "Error -5: Device not supported\n");
-				break;
-			case -6:
-				fprintf(stderr, "Error -6: Device already in use\n");
-				break;
-			case -7:
-				fprintf(stderr, "Error -7: I/O error\n");
-				break;
-			default:
-				fprintf(stderr, "Unknown error code\n");
-		}
-	}
-	
-	/* Use rtlsdr's test function to see if USB interface is accessible */
-	r = rtlsdr_get_tuner_type(dev);
-	fprintf(stderr, "Tuner type: %d (error if negative)\n", r);
-	
-	/* Try resetting the buffer */
-	r = rtlsdr_reset_buffer(dev);
-	if (r < 0) {
-		fprintf(stderr, "Failed to reset buffer: %d\n", r);
-		
-		switch(r) {
-			case -1:
-				fprintf(stderr, "Error -1: Unsupported device/function\n");
-				break;
-			case -2:
-				fprintf(stderr, "Error -2: Not enough memory\n");
-				break;
-			case -3:
-				fprintf(stderr, "Error -3: Device not found\n");
-				break;
-			case -4:
-				fprintf(stderr, "Error -4: Device busy\n");
-				break;
-			case -5:
-				fprintf(stderr, "Error -5: Device not supported\n");
-				break;
-			case -6:
-				fprintf(stderr, "Error -6: Device already in use\n");
-				break;
-			case -7:
-				fprintf(stderr, "Error -7: I/O error\n");
-				break;
-			default:
-				fprintf(stderr, "Unknown error code\n");
-		}
+		fprintf(stderr, "Failed to reset buffer: %d (this may be normal at this stage)\n", r);
 	} else {
 		fprintf(stderr, "Successfully reset buffer\n");
 	}

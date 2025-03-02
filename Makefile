@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -I./include
-LDFLAGS = -lrtlsdr -lfftw3 -lm
+CFLAGS = -Wall -Wextra -O2 -I./include `pkg-config --cflags libusb-1.0`
+LDFLAGS = -lrtlsdr -lfftw3 -lm -lusb-1.0
 
 TARGET = rf_scanner
 SRC_DIR = src
