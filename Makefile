@@ -7,10 +7,10 @@ SRC_DIR = src
 INCLUDE_DIR = include
 BUILD_DIR = build
 
-SRCS = $(wildcard $(SRC_DIR)/*.c)
-OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+SRCS = $(SRC_DIR)/main.c
+OBJS = $(BUILD_DIR)/main.o
 
-.PHONY: all clean
+.PHONY: all clean rf_scanner2
 
 all: $(BUILD_DIR) $(TARGET)
 
@@ -20,11 +20,14 @@ $(BUILD_DIR):
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+rf_scanner2: $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SRC_DIR)/rf_scanner2.c -o rf_scanner2 $(LDFLAGS)
+
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	rm -rf $(BUILD_DIR) $(TARGET) rf_scanner2
 
 lint:
 	cppcheck --enable=all --suppress=missingIncludeSystem $(SRC_DIR)/*.c $(INCLUDE_DIR)/*.h
