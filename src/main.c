@@ -567,8 +567,43 @@ void save_signal_to_file(uint8_t *buffer, uint32_t buffer_size, uint32_t frequen
 	
 	fprintf(stderr, "Signal saved to %s\n", filename);
 	
-	/* Save FFT data as well */
-	save_fft_to_file(filename, NULL, DEFAULT_FFT_SIZE, frequency, sample_rate);
+	/* Calculate FFT for the saved signal */
+	fftw_complex *in, *out;
+	fftw_plan p;
+	int fft_size = DEFAULT_FFT_SIZE;
+	
+	/* Allocate arrays for FFT */
+	in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * fft_size);
+	out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * fft_size);
+	
+	if (!in || !out) {
+		fprintf(stderr, "Memory allocation error for FFT\n");
+		if (in) fftw_free(in);
+		if (out) fftw_free(out);
+		return;
+	}
+	
+	/* Create FFT plan */
+	p = fftw_plan_dft_1d(fft_size, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+	
+	/* Fill input array with complex samples from the buffer (use only the first fft_size samples) */
+	for (int i = 0; i < fft_size && i*2+1 < buffer_size; i++) {
+		/* Convert samples to complex values (8-bit unsigned to normalized float) */
+		double real = (buffer[2*i] - 127.5) / 127.5;
+		double imag = (buffer[2*i+1] - 127.5) / 127.5;
+		in[i] = real + imag * I;
+	}
+	
+	/* Execute FFT */
+	fftw_execute(p);
+	
+	/* Save FFT data */
+	save_fft_to_file(filename, out, fft_size, frequency, sample_rate);
+	
+	/* Clean up */
+	fftw_destroy_plan(p);
+	fftw_free(in);
+	fftw_free(out);
 }
 
 void save_fft_to_file(const char *filename, fftw_complex *fft_result, int fft_size, 
