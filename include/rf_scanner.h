@@ -8,7 +8,7 @@
 
 #define DEFAULT_START_FREQ      88e6    /* 88 MHz */
 #define DEFAULT_STOP_FREQ       108e6   /* 108 MHz */
-#define DEFAULT_SAMPLE_RATE     2.4e6   /* 2.4 MHz */
+#define DEFAULT_SAMPLE_RATE     1024000   /* 1.024 MHz */
 #define DEFAULT_GAIN            40.0    /* dB */
 #define DEFAULT_SCAN_TIME       10      /* seconds */
 #define DEFAULT_SAVE_SIGNAL     1       /* 1 = enabled, 0 = disabled */

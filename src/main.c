@@ -65,7 +65,7 @@ void print_usage(const char *progname) {
 		"Options:\n"
 		"  -f <start_freq>  Start frequency in Hz (default: %.0f Hz)\n"
 		"  -F <stop_freq>   Stop frequency in Hz (default: %.0f Hz)\n"
-		"  -s <sample_rate> Sample rate in Hz (default: %.0f Hz)\n"
+		"  -s <sample_rate> Sample rate in Hz (default: %u Hz)\n"
 		"  -g <gain>        Gain in dB (default: %.1f dB)\n"
 		"  -t <scan_time>   Time to scan each frequency in seconds (default: %d s)\n"
 		"  -S <0|1>         Save signal data to file (default: %d)\n"
@@ -74,7 +74,7 @@ void print_usage(const char *progname) {
 		"  -m <0|1>         Enable simulation mode for testing without hardware (default: %d)\n"
 		"  -v <0|1>         Enable verbose logging (default: %d)\n"
 		"  -h               Show this help message\n",
-		progname, DEFAULT_START_FREQ, DEFAULT_STOP_FREQ, DEFAULT_SAMPLE_RATE, 
+		progname, DEFAULT_START_FREQ, DEFAULT_STOP_FREQ, (unsigned int)DEFAULT_SAMPLE_RATE, 
 		DEFAULT_GAIN, DEFAULT_SCAN_TIME, DEFAULT_SAVE_SIGNAL, DEFAULT_ITERATIONS,
 		DEFAULT_USE_KERNEL_DRIVER, DEFAULT_SIMULATION_MODE, DEFAULT_VERBOSE);
 	exit(1);
@@ -179,14 +179,14 @@ double random_frequency(double start, double stop, uint32_t sample_rate) {
 }
 
 int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, double gain) {
-	int device_count, device_index = 0, r;
+	int device_index = 0, r;
 	
 	/* Get verbose mode from global config */
 	extern scanner_config_t global_config;
 	int verbose = global_config.verbose;
 	
 	/* Get number of devices */
-	device_count = rtlsdr_get_device_count();
+	int device_count = rtlsdr_get_device_count();
 	if (!device_count) {
 		fprintf(stderr, "No supported devices found\n");
 		return -1;
@@ -214,53 +214,31 @@ int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, d
 		usleep(100000); /* Wait 100ms */
 	}
 	
-	/* Attempt to unload kernel modules that might interfere */
-	if (verbose) {
-		fprintf(stderr, "Checking for active kernel modules...\n");
-		system("lsmod | grep -E 'rtl|dvb' | sort");
+	/* Open device - simplified approach just like rf_scanner2.c */
+	r = rtlsdr_open(dev, (uint32_t)device_index);
+	if (r < 0) {
+		fprintf(stderr, "Failed to open rtlsdr device: error %d\n", r);
+		return -1;
 	}
 	
-	/* Open device with retry attempt */
-	for (int attempt = 0; attempt < 3; attempt++) {
-		r = rtlsdr_open(dev, (uint32_t)device_index);
-		if (r >= 0) {
-			fprintf(stderr, "Successfully opened device\n");
-			
-			/* Attempt to detach kernel driver if needed - CRITICAL STEP */
-			/* Must be done immediately after opening and before any other operations */
-			r = try_detach_kernel_driver(*dev);
-			if (r < 0) {
-				fprintf(stderr, "Warning: Could not detach kernel driver, but will continue anyway\n");
-				/* Continue anyway - the device might still work */
-			}
-			
-			break; /* Success */
-		}
-		
-		fprintf(stderr, "Failed to open rtlsdr device #%d (attempt %d/3): error %d\n", 
-			device_index, attempt+1, r);
-			
-		if (r == -6) {
-			fprintf(stderr, "Error -6 indicates the device is already claimed by another process or driver\n");
-			fprintf(stderr, "Trying to identify the process using the device...\n");
-			system("lsof | grep -i rtlsdr");
-			system("lsof /dev/bus/usb"); /* More generic check */
-			fprintf(stderr, "Try using 'sudo rmmod dvb_usb_rtl28xxu rtl2832_sdr rtl2832' to unload kernel drivers\n");
-		}
-		
-		if (attempt < 2) {
-			fprintf(stderr, "Waiting before retry...\n");
-			usleep(500000); /* Wait 500ms before retry */
-		} else {
-			fprintf(stderr, "All attempts to open device failed\n");
-			return -1;
-		}
-	}
+	fprintf(stderr, "Successfully opened device\n");
+	
+	/* Basic device check */
+	try_detach_kernel_driver(*dev);
 	
 	/* Set sample rate */
 	r = rtlsdr_set_sample_rate(*dev, sample_rate);
 	if (r < 0) {
 		fprintf(stderr, "Failed to set sample rate to %u Hz: error %d\n", sample_rate, r);
+		rtlsdr_close(*dev);
+		*dev = NULL;
+		return -1;
+	}
+	
+	/* Always set gain mode first before setting gain (like rf_scanner2.c does) */
+	r = rtlsdr_set_tuner_gain_mode(*dev, (gain == 0) ? 0 : 1);
+	if (r < 0) {
+		fprintf(stderr, "Failed to set gain mode: error %d\n", r);
 		rtlsdr_close(*dev);
 		*dev = NULL;
 		return -1;
@@ -275,64 +253,54 @@ int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, d
 		return -1;
 	}
 	
-	/* Set gain mode */
-	if (gain == 0) {
-		/* Enable automatic gain */
-		r = rtlsdr_set_tuner_gain_mode(*dev, 0);
-		if (r < 0) {
-			fprintf(stderr, "Failed to enable automatic gain\n");
-			return -1;
-		}
-		fprintf(stderr, "Automatic gain mode enabled\n");
-	} else {
-		/* Enable manual gain */
-		r = rtlsdr_set_tuner_gain_mode(*dev, 1);
-		if (r < 0) {
-			fprintf(stderr, "Failed to enable manual gain\n");
-			return -1;
-		}
-		
-		/* Set gain */
-		/* Convert dB to tenths of dB as per rtlsdr API */
-		int gain_tenths = (int)(gain * 10.0);
-		
-		/* Find the nearest supported gain */
+	/* Set gain if using manual mode */
+	if (gain != 0) {
+		/* Get available gains */
 		int num_gains = rtlsdr_get_tuner_gains(*dev, NULL);
 		if (num_gains <= 0) {
-			fprintf(stderr, "Failed to get supported gain values\n");
-			return -1;
-		}
-		
-		int *gains = malloc(num_gains * sizeof(int));
-		if (!gains) {
-			fprintf(stderr, "Memory allocation error\n");
-			return -1;
-		}
-		
-		rtlsdr_get_tuner_gains(*dev, gains);
-		
-		/* Find the nearest gain */
-		int nearest_gain = gains[0];
-		int min_diff = abs(gain_tenths - gains[0]);
-		
-		for (int i = 1; i < num_gains; i++) {
-			int diff = abs(gain_tenths - gains[i]);
-			if (diff < min_diff) {
-				min_diff = diff;
-				nearest_gain = gains[i];
+			fprintf(stderr, "Failed to get supported gain values, using default\n");
+			r = rtlsdr_set_tuner_gain(*dev, 400); /* Use a common default gain value */
+			if (r < 0) {
+				fprintf(stderr, "Warning: Failed to set tuner gain but continuing\n");
+			} else {
+				fprintf(stderr, "Gain set to 40.0 dB (default)\n");
+			}
+		} else {
+			/* Get available gain values */
+			int *gains = malloc(num_gains * sizeof(int));
+			if (!gains) {
+				fprintf(stderr, "Memory allocation error, using default gain\n");
+				r = rtlsdr_set_tuner_gain(*dev, 400);
+				if (r < 0) {
+					fprintf(stderr, "Warning: Failed to set tuner gain but continuing\n");
+				} else {
+					fprintf(stderr, "Gain set to 40.0 dB (default)\n");
+				}
+			} else {
+				rtlsdr_get_tuner_gains(*dev, gains);
+				
+				if (verbose) {
+					fprintf(stderr, "Available gains: ");
+					for (int i = 0; i < num_gains; i++) {
+						fprintf(stderr, "%.1f ", gains[i] / 10.0);
+					}
+					fprintf(stderr, "\n");
+				}
+				
+				/* Just use the middle gain value */
+				int gain_to_use = gains[num_gains / 2];
+				r = rtlsdr_set_tuner_gain(*dev, gain_to_use);
+				if (r < 0) {
+					fprintf(stderr, "Warning: Failed to set tuner gain but continuing\n");
+				} else {
+					fprintf(stderr, "Gain set to %.1f dB\n", gain_to_use / 10.0);
+				}
+				
+				free(gains);
 			}
 		}
-		
-		free(gains);
-		
-		r = rtlsdr_set_tuner_gain(*dev, nearest_gain);
-		if (r < 0) {
-			fprintf(stderr, "Failed to set tuner gain\n");
-			return -1;
-		}
-		
-		fprintf(stderr, "Gain set to %.1f dB (nearest supported value)\n", 
-			nearest_gain / 10.0);
+	} else {
+		fprintf(stderr, "Automatic gain mode enabled\n");
 	}
 	
 	/* Reset endpoint before streaming */
@@ -389,11 +357,31 @@ int scan_frequency(rtlsdr_dev_t *dev, uint32_t frequency, uint32_t sample_rate,
 	/* Get simulation mode from config - Will be passed as a global variable */
 	extern scanner_config_t global_config;
 	int simulation_mode = global_config.simulation_mode;
+	int verbose = global_config.verbose;
 	
 	if (simulation_mode) {
 		fprintf(stderr, "Note: Simulation mode is enabled (use -m 0 to disable)\n");
 	}
 	
+	/* Add a delay before reading */
+	usleep(250000);  /* 250ms delay */
+	
+	/* Try to read a smaller buffer first to test device access */
+	uint8_t test_buffer[1024];
+	int test_read = 0;
+	
+	if (verbose) {
+		fprintf(stderr, "Testing device access with small read first...\n");
+	}
+	
+	r = rtlsdr_read_sync(dev, test_buffer, sizeof(test_buffer), &test_read);
+	if (r < 0) {
+		fprintf(stderr, "Failed to perform test read: error %d\n", r);
+	} else if (verbose) {
+		fprintf(stderr, "Test read successful, read %d bytes\n", test_read);
+	}
+	
+	/* Now try full read */
 	r = rtlsdr_read_sync(dev, buffer, buffer_size, &n_read);
 	if (r < 0) {
 		fprintf(stderr, "Failed to read samples: error %d\n", r);
@@ -428,6 +416,18 @@ int scan_frequency(rtlsdr_dev_t *dev, uint32_t frequency, uint32_t sample_rate,
 				break;
 			case -11:
 				fprintf(stderr, "Error -11: Insufficient permissions or device in use by kernel driver\n");
+				fprintf(stderr, "Trying to proceed anyway with reduced buffer size...\n");
+				
+				/* Try smaller buffer size */
+				uint32_t smaller_size = buffer_size / 4;
+				r = rtlsdr_read_sync(dev, buffer, smaller_size, &n_read);
+				if (r < 0) {
+					fprintf(stderr, "Still failed with smaller buffer size\n");
+				} else {
+					fprintf(stderr, "Success with smaller buffer size! Read %d bytes\n", n_read);
+					/* Continue with what we have */
+					goto process_data;
+				}
 				break;
 			default:
 				fprintf(stderr, "Unknown error code\n");
@@ -455,6 +455,8 @@ int scan_frequency(rtlsdr_dev_t *dev, uint32_t frequency, uint32_t sample_rate,
 			return -1;
 		}
 	}
+	
+process_data:
 	
 	fprintf(stderr, "Read %d samples\n", n_read);
 	
@@ -637,80 +639,18 @@ void save_fft_to_file(const char *filename, fftw_complex *fft_result, int fft_si
 int try_detach_kernel_driver(rtlsdr_dev_t *dev) {
 	if (!dev) return -1;
 	
-	fprintf(stderr, "Attempting to detach kernel driver...\n");
+	/* Simplified approach - we don't manually attempt to detach kernel drivers
+	   since this could potentially be causing issues if not done exactly right.
+	   Instead, let librtlsdr handle this internally */
 	
-	/* Access the internal libusb device handle from the rtlsdr device */
-	/* This requires knowledge of rtlsdr library internals */
-	/* Based on examining librtlsdr source code */
+	fprintf(stderr, "Using simplified device initialization\n");
 	
-	/* Cast dev to access internal structure */
-	struct rtlsdr_dev {
-		libusb_context *ctx;
-		libusb_device_handle *devh;
-		/* ... other fields we don't need to access ... */
-	} *rtl_dev = (struct rtlsdr_dev *)dev;
-	
-	/* Skip if we can't access the device handle */
-	if (!rtl_dev || !rtl_dev->devh) {
-		fprintf(stderr, "Cannot access device handle (library internals may have changed)\n");
-		return -1;
-	}
-	
-	/* Check if kernel driver is active */
-	if (libusb_kernel_driver_active(rtl_dev->devh, 0) == 1) {
-		fprintf(stderr, "Kernel driver is active, attempting to detach...\n");
-		
-		/* Try to detach the kernel driver */
-		int r = libusb_detach_kernel_driver(rtl_dev->devh, 0);
-		if (r == 0) {
-			fprintf(stderr, "Successfully detached kernel driver\n");
-			return 0;
-		} else {
-			fprintf(stderr, "Failed to detach kernel driver: %d\n", r);
-			switch (r) {
-				case LIBUSB_ERROR_NOT_FOUND:
-					fprintf(stderr, "No kernel driver was attached\n");
-					return 0; /* Not an error */
-				case LIBUSB_ERROR_INVALID_PARAM:
-					fprintf(stderr, "Invalid parameter\n");
-					break;
-				case LIBUSB_ERROR_NO_DEVICE:
-					fprintf(stderr, "Device has been disconnected\n");
-					break;
-				case LIBUSB_ERROR_OTHER:
-					fprintf(stderr, "Other error\n");
-					break;
-				default:
-					fprintf(stderr, "Unknown error\n");
-			}
-			return -1;
-		}
-	} else {
-		fprintf(stderr, "Kernel driver is not active, no need to detach\n");
-	}
-	
-	/* Additional diagnostics for troubleshooting */
-	fprintf(stderr, "Checking USB devices...\n");
-	int device_count = rtlsdr_get_device_count();
-	fprintf(stderr, "Number of RTL-SDR devices found by librtlsdr: %d\n", device_count);
-	
-	if (device_count > 0) {
-		fprintf(stderr, "Device #0 name: %s\n", rtlsdr_get_device_name(0));
-		
-		char manufacturer[256] = {0};
-		char product[256] = {0};
-		char serial[256] = {0};
-		rtlsdr_get_device_usb_strings(0, manufacturer, product, serial);
-		fprintf(stderr, "Device #0 USB strings: Manufacturer='%s', Product='%s', Serial='%s'\n",
-			manufacturer, product, serial);
-	}
-	
-	/* Try resetting the buffer as a test of device access */
-	int r = rtlsdr_reset_buffer(dev);
+	/* Just check if the device is accessible */
+	int r = rtlsdr_get_tuner_type(dev);
 	if (r < 0) {
-		fprintf(stderr, "Failed to reset buffer: %d (this may be normal at this stage)\n", r);
+		fprintf(stderr, "Warning: Cannot get tuner type, device may not be fully accessible\n");
 	} else {
-		fprintf(stderr, "Successfully reset buffer\n");
+		fprintf(stderr, "Device tuner type: %d\n", r);
 	}
 	
 	return 0;
