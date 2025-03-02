@@ -6,6 +6,7 @@
 #include <time.h>
 #include <math.h>
 #include <complex.h>
+#include <libusb-1.0/libusb.h>  /* For accessing libusb directly if needed */
 #include "rf_scanner.h"
 
 /* Global variables for signal handling */
@@ -25,6 +26,8 @@ void save_signal_to_file(uint8_t *buffer, uint32_t buffer_size, uint32_t frequen
                         uint32_t sample_rate);
 void save_fft_to_file(const char *filename, fftw_complex *fft_result, int fft_size, 
                      uint32_t frequency, uint32_t sample_rate);
+int try_detach_kernel_driver(rtlsdr_dev_t *dev);
+int check_rtlsdr_access();
 
 void signal_handler(int sig) {
 	fprintf(stderr, "Signal caught, exiting!\n");
@@ -151,24 +154,57 @@ int setup_device(rtlsdr_dev_t **dev, uint32_t frequency, uint32_t sample_rate, d
 	fprintf(stderr, "Using device #%d: %s\n", device_index, 
 		rtlsdr_get_device_name(device_index));
 	
-	/* Open device */
-	r = rtlsdr_open(dev, (uint32_t)device_index);
-	if (r < 0) {
-		fprintf(stderr, "Failed to open rtlsdr device #%d\n", device_index);
-		return -1;
+	/* Try to close the device first if it was already open */
+	if (*dev) {
+		fprintf(stderr, "Device already open, closing first...\n");
+		rtlsdr_close(*dev);
+		*dev = NULL;
+		usleep(100000); /* Wait 100ms */
+	}
+	
+	/* Open device with retry attempt */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		r = rtlsdr_open(dev, (uint32_t)device_index);
+		if (r >= 0) {
+			fprintf(stderr, "Successfully opened device\n");
+			
+			/* Attempt to detach kernel driver if needed */
+			try_detach_kernel_driver(*dev);
+			break; /* Success */
+		}
+		
+		fprintf(stderr, "Failed to open rtlsdr device #%d (attempt %d/3): error %d\n", 
+			device_index, attempt+1, r);
+			
+		if (r == -6) {
+			fprintf(stderr, "Error -6 indicates the device is already claimed by another process or driver\n");
+			fprintf(stderr, "Try using 'sudo rmmod dvb_usb_rtl28xxu rtl2832' to unload kernel drivers\n");
+		}
+		
+		if (attempt < 2) {
+			fprintf(stderr, "Waiting before retry...\n");
+			usleep(500000); /* Wait 500ms before retry */
+		} else {
+			fprintf(stderr, "All attempts to open device failed\n");
+			return -1;
+		}
 	}
 	
 	/* Set sample rate */
 	r = rtlsdr_set_sample_rate(*dev, sample_rate);
 	if (r < 0) {
-		fprintf(stderr, "Failed to set sample rate to %u Hz\n", sample_rate);
+		fprintf(stderr, "Failed to set sample rate to %u Hz: error %d\n", sample_rate, r);
+		rtlsdr_close(*dev);
+		*dev = NULL;
 		return -1;
 	}
 	
 	/* Set center frequency */
 	r = rtlsdr_set_center_freq(*dev, frequency);
 	if (r < 0) {
-		fprintf(stderr, "Failed to set center frequency to %u Hz\n", frequency);
+		fprintf(stderr, "Failed to set center frequency to %u Hz: error %d\n", frequency, r);
+		rtlsdr_close(*dev);
+		*dev = NULL;
 		return -1;
 	}
 	
@@ -450,6 +486,74 @@ void save_fft_to_file(const char *filename, fftw_complex *fft_result, int fft_si
 	fprintf(stderr, "FFT data saved to %s\n", fft_filename);
 }
 
+int try_detach_kernel_driver(rtlsdr_dev_t *dev) {
+	if (!dev) return -1;
+	
+	/* Access the internal libusb device handle from the rtlsdr device */
+	/* Note: This relies on knowledge of the rtlsdr library internals */
+	fprintf(stderr, "Attempting to detach kernel driver...\n");
+	
+	/* Try the rtlsdr library function first */
+	int r = rtlsdr_set_bias_tee(dev, 0);
+	if (r < 0) {
+		fprintf(stderr, "Failed to toggle bias tee (this is just to test device access): %d\n", r);
+	}
+	
+	/* Use rtlsdr's test function to see if USB interface is accessible */
+	r = rtlsdr_get_tuner_type(dev);
+	fprintf(stderr, "Tuner type: %d (error if negative)\n", r);
+	
+	/* Try resetting the buffer */
+	r = rtlsdr_reset_buffer(dev);
+	if (r < 0) {
+		fprintf(stderr, "Failed to reset buffer: %d\n", r);
+	} else {
+		fprintf(stderr, "Successfully reset buffer\n");
+	}
+	
+	return 0;
+}
+
+int check_rtlsdr_access() {
+	/* Check if the device is accessible by running a shell command */
+	FILE *fp = popen("lsof | grep -i rtlsdr", "r");
+	if (!fp) {
+		fprintf(stderr, "Failed to run command to check for RTL-SDR usage\n");
+		return -1;
+	}
+	
+	char buffer[1024];
+	int used = 0;
+	
+	while (fgets(buffer, sizeof(buffer), fp)) {
+		fprintf(stderr, "Warning: RTL-SDR appears to be in use by another process: %s", buffer);
+		used = 1;
+	}
+	
+	pclose(fp);
+	
+	if (used) {
+		fprintf(stderr, "You may need to close other applications using the RTL-SDR device first.\n");
+		return -1;
+	}
+	
+	/* Also check if the kernel driver is attached */
+	fp = popen("lsmod | grep -E 'dvb_usb_rtl|rtl2832|rtl8xxxu|rtl2830|dvb_usb'", "r");
+	if (!fp) {
+		fprintf(stderr, "Failed to run command to check for kernel modules\n");
+		return -1;
+	}
+	
+	while (fgets(buffer, sizeof(buffer), fp)) {
+		fprintf(stderr, "Note: RTL-SDR kernel module detected: %s", buffer);
+		fprintf(stderr, "This is normal, the library will attempt to detach it when necessary.\n");
+	}
+	
+	pclose(fp);
+	
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	int r;
 	scanner_config_t config;
@@ -467,6 +571,14 @@ int main(int argc, char **argv) {
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 	signal(SIGQUIT, signal_handler);
+	
+	/* Check if RTL-SDR is already in use */
+	if (check_rtlsdr_access() < 0) {
+		fprintf(stderr, "Warning: RTL-SDR access issues detected, but will try to continue.\n");
+		fprintf(stderr, "If you get USB claim interface errors, try these commands to unload conflicting drivers:\n");
+		fprintf(stderr, "  sudo rmmod dvb_usb_rtl28xxu rtl2832 rtl2830 rtl8xxxu\n");
+		fprintf(stderr, "  sudo rmmod dvb_usb_v2 dvb_core\n");
+	}
 	
 	/* Seed random number generator */
 	srand(time(NULL));

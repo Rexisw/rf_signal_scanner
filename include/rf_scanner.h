@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <rtl-sdr.h>
 #include <fftw3.h>
+#include <libusb-1.0/libusb.h>
 
 #define DEFAULT_START_FREQ      88e6    /* 88 MHz */
 #define DEFAULT_STOP_FREQ       108e6   /* 108 MHz */
